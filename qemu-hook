@@ -1,0 +1,13 @@
+#!/bin/bash
+
+VM_NAME=$1
+ACTION=$2
+APP_PATH="/usr/bin/forward_ctl"
+
+if [ "${ACTION}" == "start" ]; then
+    ${APP_PATH} start ${VM_NAME}
+elif [ "${ACTION}" == "stopped" ]; then
+    ${APP_PATH} shutdown ${VM_NAME}
+elif [ "${ACTION}" == "reconnect" ]; then
+    ${APP_PATH} reconnect ${VM_NAME}
+fi

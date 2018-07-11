@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+# forward_ctl is designed for managing port forwarding of virtual machine
+
+import argparse
+import sys
+import os
+import errno
+import sqlite3
+import socket
+import logging
+import subprocess
+from psutil import net_if_addrs
+
+iptables_bin = "/sbin/iptables"
+appname = "forward_ctl"
+main_dir = '/etc/{}'.format(appname)
+db_name = 'forward.db'
+db_path = main_dir + '/' + db_name
+logfile_path = "/var/log/{}.log".format(appname)
+max_vm_len = 15
+
+if not os.geteuid() == 0:
+    sys.exit('This tools must be run as root.')
+
+logging.basicConfig(filename=logfile_path, level=logging.INFO,
+        format='%(asctime)s %(message)s')
+
+def __error(*args):
+    logging.error(*args)
+    print("[ERROR]", *args)
+
+def __info(*args):
+    logging.info(*args)
+    print("[INFO]", *args)
+
+def process_run(*args):
+    logging.info("process_run {}".format(args))
+    try:
+        r = subprocess.check_output(*args)
+        logging.debug("\n\n" + r.decode())
+    except Exception as e:
+        r = e.output
+        logging.error(r.decode())
+        raise e
+
+def iptables_add_rule(def_ex_if, def_in_if,
+        proto, host_port, guest_name, guest_ip, guest_port, 
+        external_if, internal_if):
+    if not external_if:
+        external_if = def_ex_if
+    if not internal_if:
+        internal_if = def_in_if
+    logging.info("iptables_add_rule {} {} {} {} {} {} {}".format(
+        proto, host_port, guest_name, guest_ip, guest_port, 
+        external_if, internal_if))
+    cmd = "{} -A INPUT -i {} -p {} --dport {} -j ACCEPT".format(
+            iptables_bin, external_if, proto, host_port)
+    process_run(cmd.split())
+    cmd = "{} -I FORWARD -o {} -d {} -j ACCEPT".format(
+            iptables_bin, internal_if, guest_ip)
+    process_run(cmd.split())
+    cmd = ("{} -t nat -I PREROUTING -p {} --dport {} -j DNAT --to {}:{}"
+            .format(iptables_bin, proto, host_port, guest_ip, guest_port))
+    process_run(cmd.split())
+
+def iptables_del_rule(def_ex_if, def_in_if,
+        proto, host_port, guest_name, guest_ip, guest_port, 
+        external_if, internal_if):
+    if not external_if:
+        external_if = def_ex_if
+    if not internal_if:
+        internal_if = def_in_if
+    logging.info("iptables_del_rule {} {} {} {} {} {} {}".format(
+        proto, host_port, guest_name, guest_ip, guest_port, 
+        external_if, internal_if))
+    cmd = "{} -D INPUT -i {} -p {} --dport {} -j ACCEPT".format(
+            iptables_bin, external_if, proto, host_port)
+    process_run(cmd.split())
+    cmd = "{} -D FORWARD -o {} -d {} -j ACCEPT".format(
+            iptables_bin, internal_if, guest_ip)
+    process_run(cmd.split())
+    cmd = ("{} -t nat -D PREROUTING -p {} --dport {} -j DNAT --to {}:{}"
+            .format(iptables_bin, proto, host_port, guest_ip, guest_port))
+    process_run(cmd.split())
+
+def interfaces(val):
+    all_if = net_if_addrs()
+    if all_if:
+        if val in all_if:
+            return val
+    raise TypeError
+
+
+def ip_addr(val):
+    try:
+        socket.inet_aton(val)
+    except socket.error:
+        raise TypeError
+    return val
+
+def port_num(val):
+    ival = int(val)
+    if (ival < 1) or (ival > 65535):
+        raise TypeError
+    return ival
+
+def add_cmd_list_default(subparser):
+    p = subparser.add_parser('list-default', 
+            help='list default external and internal interfaces'
+        )
+
+def add_cmd_set_default(subparser):
+    p = subparser.add_parser('set-default',
+            help='set default external and internal interfaces'
+        )
+    p.add_argument("external_if",
+            help='external interface to be used to receive public packets',
+            type=interfaces
+        )
+    p.add_argument('internal_if',
+            help='internal interface to be used to receive lan packets',
+            type=interfaces
+        )
+
+def add_cmd_list(subparser):
+    p = subparser.add_parser('list', 
+            help='list all port forwarding rules'
+        )
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("-a", "--all",
+            help='list all rules',
+            action='store_true'
+        )
+    g.add_argument('-n', '--name',
+            help='guest name which rules need to be listed',
+            metavar='VM_NAME'
+        )
+
+def add_cmd_add(subparser):
+    p = subparser.add_parser('add', 
+            help='add port forwarding rule'
+        )
+    p.add_argument("proto",
+            help='proto used by specified port',
+            choices=['tcp', 'udp']
+        )
+    p.add_argument("host_port",
+            help='host port need to be forwarded',
+            type=port_num
+        )
+    p.add_argument("guest_name",
+            help='guest name to be forwarded to'
+        )
+    p.add_argument("guest_ip",
+            help='guest ip to be forwarded to',
+            type=ip_addr
+        )
+    p.add_argument("guest_port",
+            help='guest port to be forwarded to',
+            type=port_num
+        )
+    p.add_argument('-e', '--external-if',
+            help='external interface to be used to receive public packets',
+            type=interfaces
+        )
+    p.add_argument('-i', '--internal-if',
+            help='internal interface to be used to receive lan packets',
+            type=interfaces
+        )
+
+def add_cmd_delete(subparser):
+    p = subparser.add_parser('delete', 
+            help='delete specified port forwarding rule'
+        )
+    p.add_argument("proto",
+            help='proto used by specified port',
+            choices=['tcp', 'udp']
+        )
+    p.add_argument("host_port",
+            help='host port which need to be forwarded',
+            type=port_num
+        )
+
+def add_cmd_undefine(subparser):
+    p = subparser.add_parser('undefine', 
+            help='delete all port forwarding rules of the specific guest'
+        )
+    p.add_argument("guest_name",
+            help='guest which rules needed to be deleted'
+        )
+
+def add_cmd_start(subparser):
+    p = subparser.add_parser('start', 
+            help='apply all port forwarding rules of the specific guest'
+        )
+    p.add_argument("guest_name",
+            help='guest which rules needed to be applied'
+        )
+
+def add_cmd_shutdown(subparser):
+    p = subparser.add_parser('shutdown', 
+            help='unapply all port forwarding rules of the specific guest'
+        )
+    p.add_argument("guest_name",
+            help='guest which rules needed to be unapplied'
+        )
+
+def add_cmd_reconnect(subparser):
+    p = subparser.add_parser('reconnect', 
+            help='reapply all port forwarding rules of specified guest'
+        )
+    p.add_argument("guest_name",
+            help='guest which rules need to be reconnected'
+        )
+
+def init_path(path):
+    __info('Directory {} is created.'.format(path))
+    try:
+        os.makedirs(path)
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise
+
+def connect_db(db_path):
+    conn = sqlite3.connect(db_path)
+    return conn
+
+def init_db(db_path):
+    conn = connect_db(db_path)
+    c = conn.cursor()
+    c.execute('''
+                CREATE TABLE default_val(
+                    key TEXT PRIMARY KEY, 
+                    value TEXT
+                )
+            ''')
+    c.execute('''
+                CREATE TABLE forward(
+                    proto TEXT, 
+                    host_port INTEGER, 
+                    guest_name TEXT,
+                    guest_ip TEXT,
+                    guest_port INTEGER,
+                    external_if TEXT,
+                    internal_if TEXT,
+                    PRIMARY KEY (proto, host_port)
+                )
+            ''')
+    c.execute('''
+                CREATE INDEX index_guest_name
+                ON forward (guest_name)
+            ''')
+    conn.commit()
+    return conn
+
+def prepare_db():
+    if not os.path.exists(main_dir):
+        init_path(main_dir)
+    if not os.path.exists(db_path):
+        conn = init_db(db_path)
+    else:
+        conn = connect_db(db_path)
+    return conn
+
+def print_line():
+    print('-'*(3+5+15+15+5+15+15+6))
+
+def print_list_header():
+    print('{:3s} {:5s} {:15s} {:15s} {:5s} {:15s} {:15s}'
+            .format('pro', 'hport', 'gname', 'gip', 
+                'gport', 'ex_if', 'in_if'))
+    print_line()
+
+def print_row(def_ex_if, def_in_if, 
+        proto, host_port, guest_name, guest_ip, guest_port, 
+        external_if, internal_if):
+    if len(guest_name) >= max_vm_len:
+        guest_name = (guest_name[:max_vm_len-2] + '..')
+    if not external_if:
+        external_if = "{}(d)".format(def_ex_if)
+    if not internal_if:
+        internal_if = "{}(d)".format(def_in_if)
+    print('{:3s} {:5d} {:15s} {:15s} {:5d} {:15s} {:15s}'
+            .format(proto, host_port, guest_name, guest_ip, guest_port, 
+                external_if, internal_if))
+
+def get_default_if(conn):
+    external_if = None
+    internal_if = None
+    rows = conn.execute('SELECT * from default_val')
+    for r in rows:
+        if r[0] == 'external_if':
+            external_if = r[1]
+        elif r[0] == 'internal_if':
+            internal_if = r[1]
+    if not external_if or not internal_if:
+        __error('Default external/internal interface should be set.')
+        exit(-1)
+    return external_if, internal_if
+
+def get_rule_by_host_port(conn, proto, host_port):
+    t = (proto, host_port)
+    r = conn.execute('''SELECT * FROM forward 
+        WHERE proto=? and host_port=?''', t).fetchone()
+    return r
+
+def get_all_rules(conn, guest_name=None):
+    t = (guest_name,)
+    select_statement = 'SELECT * FROM forward'
+    where_statement = ' WHERE guest_name=?'
+    order_by_statement = ' order by proto, host_port'
+    if guest_name:
+        r = conn.execute(select_statement + where_statement, t)
+    else:
+        r = conn.execute(select_statement + order_by_statement)
+    return r
+
+def delete_rule_by_host_port(conn, proto, host_port):
+    t = (proto, host_port)
+    with conn:
+        conn.execute('''
+            DELETE FROM forward WHERE proto=? and host_port=?''', t)
+
+def delete_rules_by_guest_name(conn, guest_name):
+    t = (guest_name,)
+    with conn:
+        conn.execute('''
+            DELETE FROM forward WHERE guest_name=?''', t)
+
+def add_rule(conn, proto, host_port, guest_name, guest_ip, guest_port, 
+        external_if, internal_if):
+    t = (proto, host_port, guest_name, guest_ip, guest_port, 
+            external_if, internal_if)
+    with conn:
+        conn.execute('''INSERT INTO forward 
+                VALUES (?,?,?,?,?,?,?)''', t)
+
+def list_default(conn):
+    def_ex_if, def_in_if = get_default_if(conn)
+    print('Default:')
+    print(' external_if: {}'.format(def_ex_if))
+    print(' internal_if: {}'.format(def_in_if))
+
+def set_default(conn, external_if, internal_if):
+    with conn:
+        conn.execute('''REPLACE INTO default_val 
+                VALUES (?,?)''', ("external_if", external_if))
+        conn.execute('''REPLACE INTO default_val 
+                VALUES (?,?)''', ("internal_if", internal_if))
+        __info('set default ({},{}) done.'.format(external_if, internal_if))
+
+def list_forward(conn, guest_name):
+    rows = get_all_rules(conn, guest_name)
+    def_ex_if, def_in_if = get_default_if(conn)
+    print_list_header()
+    for r in rows:
+        print_row(def_ex_if, def_in_if, *r)
+
+def add_forward(conn, proto, host_port, guest_name, guest_ip, guest_port,
+        external_if, internal_if):
+    t = (proto, host_port)
+    def_ex_if, def_in_if = get_default_if(conn)
+    r = get_rule_by_host_port(conn, *t)
+    if r is not None:
+        __error('Rule "{}/{}" exists.'.format(host_port, proto))
+        print('')
+        print_list_header()
+        print_row(def_ex_if, def_in_if, *r)
+    else:
+        add_rule(conn, proto, host_port, guest_name, guest_ip, guest_port,
+                external_if, internal_if)
+        __info('Rule "{}/{}" -> "{}({}:{})" is added.'
+                .format(proto, host_port, guest_name, guest_ip, guest_port))
+
+def delete_forward(conn, proto, host_port):
+    t = (proto, host_port)
+    r = get_rule_by_host_port(conn, *t)
+    if r is not None:
+        delete_rule_by_host_port(conn, *t)
+        __info('Rule "{}/{}" is deleted.'.format(*t))
+    else:
+        __error('Rule "{}/{}" does not exist.'.format(*t))
+
+def undefine_forward(conn, guest_name):
+    t = (guest_name, )
+    r = get_all_rules(conn, *t).fetchone()
+    if r is not None:
+        delete_rules_by_guest_name(conn, *t)
+        __info('Guest "{}" is undefined.'.format(*t))
+    else:
+        __info('Guest "{}" does not exist.'.format(*t))
+
+def start_forward(conn, guest_name):
+    rows = get_all_rules(conn, guest_name)
+    def_ex_if, def_in_if = get_default_if(conn)
+    cnt = 0
+    for r in rows:
+        iptables_add_rule(def_ex_if, def_in_if, *r)
+        cnt += 1
+    if cnt == 0:
+        __info('Guest "{}" does not exist.'.format(guest_name))
+
+def shutdown_forward(conn, guest_name):
+    rows = get_all_rules(conn, guest_name)
+    def_ex_if, def_in_if = get_default_if(conn)
+    cnt = 0
+    for r in rows:
+        iptables_del_rule(def_ex_if, def_in_if, *r)
+        cnt += 1
+    if cnt == 0:
+        __info('Guest "{}" does not exist.'.format(guest_name))
+
+def reconnect_forward(conn, guest_name):
+    rows = get_all_rules(conn, guest_name)
+    def_ex_if, def_in_if = get_default_if(conn)
+    cnt = 0
+    for r in rows:
+        iptables_del_rule(def_ex_if, def_in_if, *r)
+        iptables_add_rule(def_ex_if, def_in_if, *r)
+        cnt += 1
+    if cnt == 0:
+        __info('Guest "{}" does not exist.'.format(guest_name))
+
+def main():
+    parser = argparse.ArgumentParser()
+    subparser = parser.add_subparsers(help='sub-command', dest='mode')
+
+    add_cmd_list_default(subparser)
+    add_cmd_set_default(subparser)
+    add_cmd_list(subparser)
+    add_cmd_add(subparser)
+    add_cmd_delete(subparser)
+    add_cmd_undefine(subparser)
+    add_cmd_start(subparser)
+    add_cmd_shutdown(subparser)
+    add_cmd_reconnect(subparser)
+
+    args = parser.parse_args()
+
+    conn = prepare_db()
+
+    if args.mode == 'list-default':
+        list_default(conn)
+    elif args.mode == 'set-default':
+        set_default(conn, args.external_if, args.internal_if)
+    elif args.mode == 'list':
+        list_forward(conn, args.name)
+    elif args.mode == 'add':
+        add_forward(conn, args.proto, args.host_port, 
+                args.guest_name, args.guest_ip, args.guest_port, 
+                args.external_if, args.internal_if)
+    elif args.mode == 'delete':
+        delete_forward(conn, args.proto, args.host_port)
+    elif args.mode == 'undefine':
+        undefine_forward(conn, args.guest_name)
+    elif args.mode == 'start':
+        start_forward(conn, args.guest_name)
+    elif args.mode == 'shutdown':
+        shutdown_forward(conn, args.guest_name)
+    elif args.mode == 'reconnect':
+        reconnect_forward(conn, args.guest_name)
+    else:
+        parser.print_help()
+
+    conn.close()
+
+if __name__ == "__main__":
+    main()
